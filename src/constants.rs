@@ -1,0 +1,2 @@
+/// 1 NEAR = 10^24 yoctoNEAR.
+pub const YOCTO_PER_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
