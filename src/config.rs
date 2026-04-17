@@ -13,6 +13,12 @@ pub struct RpcConfig {
 pub struct NearwConfig {
     #[serde(default)]
     pub rpc: Option<RpcConfig>,
+    /// Override for 1Click API base URL (default: https://1click.chaindefuser.com)
+    #[serde(default)]
+    pub oneclick_api: Option<String>,
+    /// JWT token for 1Click API (0% platform fee). Also checked via ONECLICK_JWT env var.
+    #[serde(default)]
+    pub oneclick_jwt: Option<String>,
 }
 
 /// Load config from ~/.nearw/config.toml. Returns defaults if file is missing.

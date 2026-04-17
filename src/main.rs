@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod constants;
 mod network;
+mod oneclick;
 mod storage;
 mod wallet;
 
@@ -89,6 +90,41 @@ enum Commands {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
+    },
+    /// Call a contract method (state-changing transaction)
+    Call {
+        /// Contract account ID
+        contract: String,
+        /// Method name
+        method: String,
+        /// JSON arguments (e.g. '{"account_id": "alice.near"}')
+        args: String,
+        /// NEAR deposit amount (e.g. "0.1" for NEAR, "1yocto" for yoctoNEAR)
+        #[arg(long)]
+        deposit: Option<String>,
+        /// Gas in TGas (default: 100)
+        #[arg(long)]
+        gas: Option<u64>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirmed: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// View a contract method (read-only, no transaction)
+    View {
+        /// Contract account ID
+        contract: String,
+        /// Method name
+        method: String,
+        /// JSON arguments (optional, defaults to '{}')
+        args: Option<String>,
+    },
+    /// Token swap via NEAR Intents protocol (mainnet only)
+    Swap {
+        #[command(subcommand)]
+        command: SwapCommand,
     },
 }
 
@@ -223,6 +259,51 @@ enum KeyCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SwapCommand {
+    /// Execute a token swap via NEAR Intents (mainnet only)
+    Execute {
+        /// Source token (alias like USDT, NEAR, or contract ID)
+        from: String,
+        /// Destination token (alias like USDT, NEAR, or contract ID)
+        to: String,
+        /// Amount to swap (in human-readable units, e.g. "100" for 100 USDT)
+        amount: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirmed: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a swap quote without executing
+    Quote {
+        /// Source token
+        from: String,
+        /// Destination token
+        to: String,
+        /// Amount to swap
+        amount: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check the status of an existing swap
+    Status {
+        /// Deposit address from a previous swap
+        deposit_address: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List supported tokens for swaps
+    Tokens {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
@@ -350,6 +431,64 @@ async fn run() -> Result<()> {
             }
             KeyCommand::Import { contract } => {
                 cli::key::import(wallet_name, &contract)?;
+            }
+        },
+        Commands::Call {
+            contract,
+            method,
+            args,
+            deposit,
+            gas,
+            confirmed,
+            json,
+        } => {
+            cli::call::run(
+                wallet_name,
+                cli_network,
+                &contract,
+                &method,
+                &args,
+                deposit.as_deref(),
+                gas,
+                confirmed,
+                json,
+            )
+            .await?;
+        }
+        Commands::View {
+            contract,
+            method,
+            args,
+        } => {
+            cli::call::view(cli_network, &contract, &method, args.as_deref()).await?;
+        }
+        Commands::Swap { command } => match command {
+            SwapCommand::Execute {
+                from,
+                to,
+                amount,
+                confirmed,
+                json,
+            } => {
+                cli::swap::execute(wallet_name, cli_network, &from, &to, &amount, confirmed, json)
+                    .await?;
+            }
+            SwapCommand::Quote {
+                from,
+                to,
+                amount,
+                json,
+            } => {
+                cli::swap::quote(wallet_name, cli_network, &from, &to, &amount, json).await?;
+            }
+            SwapCommand::Status {
+                deposit_address,
+                json,
+            } => {
+                cli::swap::status(&deposit_address, json).await?;
+            }
+            SwapCommand::Tokens { json } => {
+                cli::swap::tokens(json).await?;
             }
         },
     }
