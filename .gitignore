@@ -1,7 +1,6 @@
 # Rust build artifacts
 /target
 debug/
-vendor/
 **/*.rs.bk
 *.pdb
 PRD.md
