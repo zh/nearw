@@ -271,7 +271,10 @@ pub async fn execute(
             .map_err(|e| anyhow::anyhow!("wNEAR wrap tx failed: {}", e))?;
     }
 
-    // Step 5: Deposit via ft_transfer_call
+    // Step 5: Deposit via ft_transfer (plain, not ft_transfer_call).
+    // 1Click deposit addresses are 64-char hex implicit accounts with no
+    // contract code, so ft_transfer_call would fail the ft_on_transfer
+    // callback and trigger ft_resolve_transfer to refund the tokens.
     // F3: Handle wrap-succeeded-but-deposit-failed with recovery instructions
     if !json_output {
         println!("Depositing {} {}...", amount, from_sym);
@@ -287,7 +290,7 @@ pub async fn execute(
 
     let deposit_result = Tokens::account(sender_id.clone())
         .send_to(deposit_address)
-        .ft_call(ft_contract, ft_balance, "".to_string())
+        .ft(ft_contract, ft_balance)
         .with_signer(signer)
         .send_to(&net)
         .await;
