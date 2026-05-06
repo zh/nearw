@@ -24,6 +24,9 @@ const POLL_BACKOFF_FACTOR: f64 = 1.5;
 /// Validate format before sending funds.
 const DEPOSIT_ADDR_HEX_LEN: usize = 64;
 
+/// NEAR Intents settlement contract on mainnet.
+const INTENTS_CONTRACT_ID: &str = "intents.near";
+
 /// Resolve a token name/alias to (defuse_asset_id, contract_id, decimals).
 /// Tries alias map first, then treats input as a raw contract ID.
 async fn resolve_token(
@@ -271,34 +274,50 @@ pub async fn execute(
             .map_err(|e| anyhow::anyhow!("wNEAR wrap tx failed: {}", e))?;
     }
 
-    // Step 5: Deposit via ft_transfer (plain, not ft_transfer_call).
-    // 1Click deposit addresses are 64-char hex implicit accounts with no
-    // contract code, so ft_transfer_call would fail the ft_on_transfer
-    // callback and trigger ft_resolve_transfer to refund the tokens.
-    // F3: Handle wrap-succeeded-but-deposit-failed with recovery instructions
+    // Step 5: Two-tx deposit into NEAR Intents.
+    //
+    // 1Click depositType=INTENTS expects funds inside the `intents.near` MT
+    // ledger, credited to a virtual sub-account (the 64-char hex
+    // `depositAddress`). Sending plain ft_transfer (or ft_transfer_call) to
+    // the implicit address parks funds in an unrecoverable on-chain account.
+    // The correct flow is:
+    //
+    //   5a) ft_transfer_call(wrap.near -> intents.near, msg=sender_id)
+    //       Deposits FT into intents.near under the sender's account.
+    //   5b) mt_transfer(intents.near, token_id=from_defuse,
+    //                   receiver_id=deposit_address)
+    //       Routes the credit to the 1Click deposit slot inside intents.
+    //
+    // Reference: nearuaguild/near-intents-1click-example/src/near.ts.
+    //
+    // Recovery: if 5a succeeds but 5b fails, funds sit in intents.near under
+    // the sender's account and can be recovered via mt_transfer/withdraw.
     if !json_output {
-        println!("Depositing {} {}...", amount, from_sym);
+        println!("Depositing {} {} into intents.near...", amount, from_sym);
     }
 
     let ft_contract: near_api::AccountId = from_contract.parse()?;
-    let deposit_address: near_api::AccountId = q.deposit_address.parse()
+    let intents_contract: near_api::AccountId = INTENTS_CONTRACT_ID.parse()?;
+    // Validate the API-provided deposit address (also serves as receiver_id
+    // inside intents.near for the mt_transfer call).
+    let _: near_api::AccountId = q.deposit_address.parse()
         .map_err(|_| anyhow::anyhow!(
             "invalid deposit address from API: {}", q.deposit_address
         ))?;
 
     let ft_balance = FTBalance::with_decimals(from_decimals).with_amount(raw_amount);
 
-    let deposit_result = Tokens::account(sender_id.clone())
-        .send_to(deposit_address)
-        .ft(ft_contract, ft_balance)
-        .with_signer(signer)
+    // Step 5a: ft_transfer_call to intents.near
+    let intents_deposit_result = Tokens::account(sender_id.clone())
+        .send_to(intents_contract.clone())
+        .ft_call(ft_contract, ft_balance, sender_id.to_string())
+        .with_signer(signer.clone())
         .send_to(&net)
         .await;
 
-    // F3: If deposit fails after a native NEAR wrap, give clear recovery instructions
-    let deposit_result = match deposit_result {
+    let intents_deposit_result = match intents_deposit_result {
         Err(e) if is_native_near => {
-            eprintln!("ERROR: Deposit failed after wNEAR wrap succeeded.");
+            eprintln!("ERROR: Intents deposit failed after wNEAR wrap succeeded.");
             eprintln!("Your {} wNEAR is safe in your account.", amount);
             eprintln!(
                 "To unwrap: nearw call wrap.near near_withdraw \
@@ -306,17 +325,20 @@ pub async fn execute(
                 raw_amount
             );
             eprintln!("To retry with existing wNEAR: nearw swap execute WNEAR {} {}", to, amount);
-            return Err(anyhow::anyhow!("deposit tx error: {:#}", e));
+            return Err(anyhow::anyhow!("intents deposit (ft_transfer_call) error: {:#}", e));
         }
-        Err(e) => return Err(anyhow::anyhow!("deposit tx error: {:#}", e)),
+        Err(e) => return Err(anyhow::anyhow!("intents deposit (ft_transfer_call) error: {:#}", e)),
         Ok(r) => r,
     };
 
-    let deposit_result = deposit_result
+    let _intents_deposit = intents_deposit_result
         .into_result()
         .map_err(|e| {
+            eprintln!(
+                "ERROR: Intents deposit (ft_transfer_call) tx failed: {}",
+                e
+            );
             if is_native_near {
-                eprintln!("ERROR: Deposit transaction failed after wNEAR wrap succeeded.");
                 eprintln!("Your {} wNEAR is safe in your account.", amount);
                 eprintln!(
                     "To unwrap: nearw call wrap.near near_withdraw \
@@ -325,10 +347,52 @@ pub async fn execute(
                 );
                 eprintln!("To retry with existing wNEAR: nearw swap execute WNEAR {} {}", to, amount);
             }
-            anyhow::anyhow!("deposit tx failed: {}", e)
+            anyhow::anyhow!("intents deposit tx failed: {}", e)
         })?;
 
-    let deposit_tx_hash = deposit_result.outcome().transaction_hash.to_string();
+    // Step 5b: mt_transfer on intents.near to the 1Click deposit_address.
+    // If this fails, funds remain inside intents.near under the sender's
+    // account and can be withdrawn or retried.
+    let mt_result = Contract(intents_contract.clone())
+        .call_function("mt_transfer", json!({
+            "token_id": from_defuse,
+            "receiver_id": q.deposit_address,
+            "amount": raw_amount.to_string(),
+        }))
+        .transaction()
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(NearGas::from_tgas(30))
+        .with_signer(sender_id.clone(), signer.clone())
+        .send_to(&net)
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "ERROR: mt_transfer to deposit address failed: {:#}",
+                e
+            );
+            eprintln!(
+                "Your {} {} is held inside intents.near under {}.",
+                amount, from_sym, sender_id
+            );
+            eprintln!(
+                "Retry: nearw call intents.near mt_transfer \
+                 '{{\"token_id\":\"{}\",\"receiver_id\":\"{}\",\"amount\":\"{}\"}}' \
+                 --deposit 1yocto --gas 30",
+                from_defuse, q.deposit_address, raw_amount
+            );
+            anyhow::anyhow!("mt_transfer error: {:#}", e)
+        })?
+        .into_result()
+        .map_err(|e| {
+            eprintln!("ERROR: mt_transfer tx failed: {}", e);
+            eprintln!(
+                "Your {} {} is held inside intents.near under {}.",
+                amount, from_sym, sender_id
+            );
+            anyhow::anyhow!("mt_transfer tx failed: {}", e)
+        })?;
+
+    let deposit_tx_hash = mt_result.outcome().transaction_hash.to_string();
 
     if !json_output {
         println!(
