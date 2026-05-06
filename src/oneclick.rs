@@ -105,6 +105,28 @@ pub struct DepositSubmitRequest {
 
 // -- Status --
 
+/// Tx hash entry from 1Click status. Accepts either a bare hash string
+/// (older shape) or an object `{hash, explorerUrl}` (current shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TxHashEntry {
+    Object {
+        hash: String,
+        #[serde(default, rename = "explorerUrl")]
+        explorer_url: String,
+    },
+    Str(String),
+}
+
+impl TxHashEntry {
+    pub fn hash(&self) -> &str {
+        match self {
+            TxHashEntry::Object { hash, .. } => hash.as_str(),
+            TxHashEntry::Str(s) => s.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapDetails {
@@ -112,10 +134,14 @@ pub struct SwapDetails {
     pub amount_out: Option<String>,
     #[serde(default)]
     pub amount_out_formatted: Option<String>,
+    /// Legacy field (some responses still emit it as bare hashes).
     #[serde(default)]
-    pub near_tx_hashes: Vec<String>,
+    pub near_tx_hashes: Vec<TxHashEntry>,
+    /// Current field (objects with `hash`/`explorerUrl`).
     #[serde(default)]
-    pub destination_chain_tx_hashes: Vec<String>,
+    pub origin_chain_tx_hashes: Vec<TxHashEntry>,
+    #[serde(default)]
+    pub destination_chain_tx_hashes: Vec<TxHashEntry>,
     #[serde(default)]
     pub refund_reason: Option<String>,
 }
@@ -123,7 +149,8 @@ pub struct SwapDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapStatus {
-    /// Status: PENDING_DEPOSIT, DEPOSITED, SWAPPING, COMPLETED, FAILED, REFUNDED
+    /// Status: PENDING_DEPOSIT, INCOMPLETE_DEPOSIT, KNOWN_DEPOSIT_TX,
+    /// PROCESSING, SUCCESS, COMPLETED, FAILED, REFUNDED.
     pub status: String,
     #[serde(default)]
     pub swap_details: Option<SwapDetails>,
@@ -133,18 +160,25 @@ pub struct SwapStatus {
 
 impl SwapStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "COMPLETED" | "FAILED" | "REFUNDED")
+        matches!(
+            self.status.as_str(),
+            "SUCCESS" | "COMPLETED" | "FAILED" | "REFUNDED"
+        )
     }
 
     pub fn is_completed(&self) -> bool {
-        self.status == "COMPLETED"
+        matches!(self.status.as_str(), "SUCCESS" | "COMPLETED")
     }
 
-    /// Get output tx hash if available.
+    /// Get output tx hash if available — destination chain wins, then origin.
     pub fn tx_hash(&self) -> Option<&str> {
         self.swap_details.as_ref()
-            .and_then(|d| d.near_tx_hashes.first().or(d.destination_chain_tx_hashes.first()))
-            .map(|s| s.as_str())
+            .and_then(|d| {
+                d.destination_chain_tx_hashes.first()
+                    .or(d.origin_chain_tx_hashes.first())
+                    .or(d.near_tx_hashes.first())
+            })
+            .map(|e| e.hash())
     }
 
     /// Get output amount if available.

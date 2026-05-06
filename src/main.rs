@@ -126,6 +126,11 @@ enum Commands {
         #[command(subcommand)]
         command: SwapCommand,
     },
+    /// NEAR Intents (intents.near) ledger operations (mainnet only)
+    Intents {
+        #[command(subcommand)]
+        command: IntentsCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -298,6 +303,34 @@ enum SwapCommand {
     },
     /// List supported tokens for swaps
     Tokens {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntentsCommand {
+    /// Show your multi-token balance inside intents.near
+    Balance {
+        /// Token alias or contract ID (e.g. USDC, wrap.near)
+        token: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Withdraw a fungible token from intents.near to an on-chain FT balance
+    Withdraw {
+        /// Token alias or contract ID (e.g. USDC, wrap.near)
+        token: String,
+        /// Amount in human-readable units (e.g. "0.75" for 0.75 USDC)
+        amount: String,
+        /// Receiver account (defaults to wallet's account)
+        #[arg(long)]
+        receiver: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirmed: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -489,6 +522,29 @@ async fn run() -> Result<()> {
             }
             SwapCommand::Tokens { json } => {
                 cli::swap::tokens(json).await?;
+            }
+        },
+        Commands::Intents { command } => match command {
+            IntentsCommand::Balance { token, json } => {
+                cli::intents::balance(wallet_name, cli_network, Some(&token), json).await?;
+            }
+            IntentsCommand::Withdraw {
+                token,
+                amount,
+                receiver,
+                confirmed,
+                json,
+            } => {
+                cli::intents::withdraw(
+                    wallet_name,
+                    cli_network,
+                    &token,
+                    &amount,
+                    receiver.as_deref(),
+                    confirmed,
+                    json,
+                )
+                .await?;
             }
         },
     }

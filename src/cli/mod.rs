@@ -1,6 +1,7 @@
 pub mod balance;
 pub mod call;
 pub mod history;
+pub mod intents;
 pub mod key;
 pub mod nft;
 pub mod receive;

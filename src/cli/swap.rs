@@ -191,7 +191,7 @@ pub async fn execute(
 
     // Step 1: Resolve tokens
     let (from_defuse, from_contract, from_decimals) = resolve_token(from, &net).await?;
-    let (to_defuse, _to_contract, to_decimals) = resolve_token(to, &net).await?;
+    let (to_defuse, to_contract, to_decimals) = resolve_token(to, &net).await?;
 
     let is_native_near = from.to_uppercase() == "NEAR";
     let raw_amount = parse_ft_amount(amount, from_decimals)?;
@@ -404,42 +404,77 @@ pub async fn execute(
     // Step 6: Notify API of deposit
     client.submit_deposit(&deposit_tx_hash, &q.deposit_address).await?;
 
-    // Step 7: Poll for completion
+    // Step 7: Snapshot recipient's destination FT balance, then poll both
+    // 1Click status and chain state. Chain settlement is the source of truth:
+    // the 1Click status indexer is sometimes lagged or stale even after the
+    // solver has emitted the on-chain ft_transfer.
+    let to_contract_id: near_api::AccountId = to_contract.parse()?;
+    let baseline_out = fetch_ft_balance(&net, &sender_id, &to_contract_id).await;
+    let min_out: u128 = q.min_amount_out.as_deref()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| q.amount_out.parse().ok())
+        .unwrap_or(0);
+
     if !json_output {
         println!("Polling swap status...");
     }
 
     let deposit_addr = q.deposit_address.clone();
-    let final_status = poll_status(
+    let outcome = poll_until_settled(
         &client,
+        &net,
         &deposit_addr,
+        &sender_id,
+        &to_contract_id,
+        baseline_out,
+        min_out,
         json_output,
     )
     .await?;
 
+    let final_status = &outcome.status;
+
     // Step 8: Output result
     if json_output {
+        let chain_amount_out = outcome.chain_delta.map(|d| d.to_string());
+        let chain_amount_out_formatted = outcome.chain_delta
+            .map(|d| format_amount_with_decimals(&d.to_string(), to_decimals));
         println!(
             "{}",
             serde_json::json!({
                 "status": final_status.status,
+                "settled_via": outcome.source_label(),
                 "deposit_tx_hash": deposit_tx_hash,
                 "deposit_address": deposit_addr,
+                "correlation_id": quote_resp.correlation_id,
                 "from_token": from_defuse,
                 "to_token": to_defuse,
                 "amount_in": q.amount_in,
-                "amount_out": final_status.amount_out(),
+                "amount_out": final_status.amount_out().map(|s| s.to_string())
+                    .or(chain_amount_out),
+                "amount_out_formatted": final_status.amount_out_formatted()
+                    .map(|s| s.to_string())
+                    .or(chain_amount_out_formatted),
                 "tx_hash": final_status.tx_hash(),
                 "network": "mainnet",
             })
         );
-    } else if final_status.is_completed() {
+    } else if outcome.is_settled() {
         println!("{}", "Swap completed!".green().bold());
-        if let Some(out) = final_status.amount_out_formatted() {
+        if let Some(delta) = outcome.chain_delta {
+            println!(
+                "  Received: {} {} (on-chain)",
+                format_amount_with_decimals(&delta.to_string(), to_decimals),
+                to_sym
+            );
+        } else if let Some(out) = final_status.amount_out_formatted() {
             println!("  Received: {} {}", out, to_sym);
         }
         if let Some(hash) = final_status.tx_hash() {
             println!("  Tx: {}", network::explorer_tx_url("mainnet", hash).cyan());
+        }
+        if outcome.source == PollSource::Chain {
+            println!("  {}", "(1Click status indexer lagged; chain confirms)".dimmed());
         }
     } else {
         println!("{}", "Swap failed.".red().bold());
@@ -484,14 +519,69 @@ fn mainnet_guard(cli_network: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Poll swap status with exponential backoff.
-async fn poll_status(
+#[derive(Debug, PartialEq, Eq)]
+enum PollSource {
+    OneClick,
+    Chain,
+}
+
+struct PollOutcome {
+    status: crate::oneclick::SwapStatus,
+    /// On-chain delta in destination FT (raw units), if observed.
+    chain_delta: Option<u128>,
+    /// Which signal triggered termination.
+    source: PollSource,
+}
+
+impl PollOutcome {
+    fn is_settled(&self) -> bool {
+        match self.source {
+            PollSource::Chain => self.chain_delta.is_some(),
+            PollSource::OneClick => self.status.is_completed(),
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        match self.source {
+            PollSource::Chain => "chain",
+            PollSource::OneClick => "1click",
+        }
+    }
+}
+
+/// Read FT balance for `account` on `ft_contract`. Returns `None` if the
+/// account isn't registered on the FT contract (no storage) or any RPC
+/// error — both treated as "no baseline available".
+async fn fetch_ft_balance(
+    net: &near_api::NetworkConfig,
+    account: &near_api::AccountId,
+    ft_contract: &near_api::AccountId,
+) -> Option<u128> {
+    use near_api::Tokens;
+    Tokens::account(account.clone())
+        .ft_balance(ft_contract.clone())
+        .fetch_from(net)
+        .await
+        .ok()
+        .map(|b| b.amount())
+}
+
+/// Poll until 1Click reports terminal OR chain-side FT balance settles.
+/// Chain wins to handle 1Click indexer lag/staleness.
+#[allow(clippy::too_many_arguments)]
+async fn poll_until_settled(
     client: &OneClickClient,
+    net: &near_api::NetworkConfig,
     deposit_address: &str,
+    recipient: &near_api::AccountId,
+    to_contract: &near_api::AccountId,
+    baseline_out: Option<u128>,
+    min_out: u128,
     quiet: bool,
-) -> Result<crate::oneclick::SwapStatus> {
+) -> Result<PollOutcome> {
     let start = std::time::Instant::now();
     let mut interval_ms = POLL_INITIAL_INTERVAL_MS;
+    let mut last_status: Option<crate::oneclick::SwapStatus> = None;
 
     loop {
         let elapsed = start.elapsed().as_secs();
@@ -505,18 +595,58 @@ async fn poll_status(
 
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
 
-        let status = client.status(deposit_address).await?;
-
-        if !quiet {
-            eprint!("\r  Status: {} ({}s elapsed)",
-                colorize_status(&status.status), elapsed);
+        // Chain check (fast path — settles even when 1Click is lagged).
+        if let (Some(base), Some(now)) = (
+            baseline_out,
+            fetch_ft_balance(net, recipient, to_contract).await,
+        ) {
+            if let Some(delta) = now.checked_sub(base) {
+                if delta > 0 && delta >= min_out {
+                    if !quiet {
+                        eprintln!("\r  Status: {} ({}s elapsed) — chain settled",
+                            "completed".green(), elapsed);
+                    }
+                    let status = last_status.unwrap_or(crate::oneclick::SwapStatus {
+                        status: "SUCCESS".to_string(),
+                        swap_details: None,
+                        correlation_id: None,
+                    });
+                    return Ok(PollOutcome {
+                        status,
+                        chain_delta: Some(delta),
+                        source: PollSource::Chain,
+                    });
+                }
+            }
         }
 
-        if status.is_terminal() {
-            if !quiet {
-                eprintln!(); // newline after carriage-return progress
+        // 1Click status check.
+        match client.status(deposit_address).await {
+            Ok(status) => {
+                if !quiet {
+                    eprint!("\r  Status: {} ({}s elapsed)",
+                        colorize_status(&status.status), elapsed);
+                }
+                if status.is_terminal() {
+                    if !quiet {
+                        eprintln!();
+                    }
+                    return Ok(PollOutcome {
+                        status,
+                        chain_delta: None,
+                        source: PollSource::OneClick,
+                    });
+                }
+                last_status = Some(status);
             }
-            return Ok(status);
+            Err(e) => {
+                // Don't fail the whole swap on a transient status read error;
+                // keep polling and let chain check carry us through.
+                if !quiet {
+                    eprint!("\r  Status: 1click read error ({}s elapsed): {}",
+                        elapsed, e);
+                }
+            }
         }
 
         // Exponential backoff
@@ -530,13 +660,19 @@ async fn poll_status(
 /// Colorize swap status string.
 fn colorize_status(status: &str) -> String {
     match status {
-        "COMPLETED" => "completed".green().to_string(),
+        "SUCCESS" | "COMPLETED" => status.to_lowercase().green().to_string(),
         "FAILED" | "REFUNDED" => status.to_lowercase().red().to_string(),
         _ => status.to_lowercase().yellow().to_string(),
     }
 }
 
 /// Build a QuoteRequest with standard defaults for NEAR-to-NEAR swaps.
+///
+/// `depositType: INTENTS` — we deposit through the intents.near MT ledger
+/// via the two-tx ft_transfer_call + mt_transfer flow.
+/// `recipientType: DESTINATION_CHAIN` — solver emits an on-chain ft_transfer
+/// to the user's regular FT balance (skips the manual mt_withdraw step).
+/// `refundType: ORIGIN_CHAIN` — failed swaps refund to the on-chain origin.
 fn build_quote_request(
     from_defuse: &str,
     to_defuse: &str,
@@ -553,9 +689,9 @@ fn build_quote_request(
         slippage_tolerance: 100, // 1%
         deposit_type: "INTENTS".to_string(),
         refund_to: sender.to_string(),
-        refund_type: "INTENTS".to_string(),
+        refund_type: "ORIGIN_CHAIN".to_string(),
         recipient: sender.to_string(),
-        recipient_type: "INTENTS".to_string(),
+        recipient_type: "DESTINATION_CHAIN".to_string(),
         dry: false,
         deadline: deadline.to_rfc3339(),
     }
